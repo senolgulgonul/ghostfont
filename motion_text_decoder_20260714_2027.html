@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Motion Coherence Text Decoder</title>
+<style>
+  :root{--bg:#0b0f0d;--panel:#111714;--line:#1e2b25;--txt:#c9d6cf;--dim:#6f8279;--acc:#3ddc84;--acc2:#22a05f;--warn:#e0b040}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  header{padding:18px 22px;border-bottom:1px solid var(--line)}
+  h1{margin:0;font-size:16px;letter-spacing:.12em;text-transform:uppercase;color:var(--acc)}
+  header p{margin:6px 0 0;color:var(--dim);font-size:12.5px;max-width:900px}
+  main{display:grid;grid-template-columns:300px 1fr;gap:18px;padding:18px 22px}
+  @media(max-width:880px){main{grid-template-columns:1fr}}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:14px}
+  .panel h2{margin:0 0 10px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim)}
+  label{display:block;margin:10px 0 4px;font-size:12px;color:var(--dim)}
+  input[type=file]{width:100%;font:inherit;color:var(--txt)}
+  input[type=range]{width:100%;accent-color:var(--acc)}
+  select,button{width:100%;font:inherit;background:#0d1310;color:var(--txt);border:1px solid var(--line);border-radius:4px;padding:7px}
+  button{cursor:pointer;border-color:var(--acc2);color:var(--acc);margin-top:12px}
+  button:hover:enabled{background:#0f1a14}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  .val{float:right;color:var(--acc)}
+  canvas{width:100%;background:#000;border:1px solid var(--line);border-radius:4px;display:block}
+  #log{margin-top:10px;font-size:12px;color:var(--dim);white-space:pre-wrap;min-height:2.4em}
+  .bar{height:4px;background:#0d1310;border:1px solid var(--line);border-radius:3px;overflow:hidden;margin-top:10px}
+  .bar>div{height:100%;width:0;background:var(--acc);transition:width .12s linear}
+  video{display:none}
+  #text{font-size:22px;letter-spacing:.06em;color:var(--acc);word-break:break-word;min-height:1.4em}
+  #cands{font-size:12px;color:var(--dim);white-space:pre-wrap;margin-top:8px}
+  .note{font-size:12px;color:var(--warn);margin-top:8px}
+  .thumbs{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .thumbs canvas{width:150px;border-color:var(--line);cursor:pointer}
+  .thumbs canvas.sel{border-color:var(--acc)}
+</style>
+</head>
+<body>
+<header>
+  <h1>Motion Coherence Text Decoder</h1>
+  <p>Upload a dot-field video whose message is carried by motion rather than luminance. The tool estimates the global background velocity between consecutive frames to subpixel accuracy, warps and subtracts, and accumulates the residual over short temporal windows. Dots that ride the coherent flow cancel; static or incoherent dots do not, and the text appears. It then binarizes the sharpest window and runs OCR to return the message as a string. Frame extraction and decoding are fully local; only the optional OCR step fetches a library from a CDN.</p>
+</header>
+
+<main>
+  <div class="panel">
+    <h2>Input</h2>
+    <input type="file" id="file" accept="video/*">
+
+    <label>Estimator</label>
+    <select id="mode">
+      <option value="mc">Motion-compensated residual (accurate)</option>
+      <option value="fd">Frame difference (fast, no motion model)</option>
+    </select>
+
+    <label>Max processing width <span class="val" id="vw">960</span></label>
+    <input type="range" id="maxw" min="320" max="1600" step="80" value="960">
+
+    <label>Window length <span class="val" id="vlen">60</span> frames</label>
+    <input type="range" id="len" min="10" max="150" step="10" value="20">
+
+    <label>Crop margin <span class="val" id="vcrop">4</span>%</label>
+    <input type="range" id="crop" min="0" max="15" step="1" value="4">
+
+    <label>Smoothing sigma <span class="val" id="vsig">1.2</span></label>
+    <input type="range" id="sig" min="0" max="4" step="0.2" value="1.2">
+
+    <label>Polarity</label>
+    <select id="pol">
+      <option value="1">Dark text on light</option>
+      <option value="0">Light text on dark</option>
+    </select>
+
+    <button id="run" disabled>Decode</button>
+    <div class="bar"><div id="prog"></div></div>
+    <button id="ocr" disabled>Read text (OCR)</button>
+    <button id="save" disabled>Download PNG</button>
+    <div id="log">Waiting for a video file.</div>
+  </div>
+
+  <div class="panel">
+    <h2>Decoded text</h2>
+    <div id="text">&mdash;</div>
+    <div id="cands"></div>
+
+    <h2 style="margin-top:16px">Coherence map (sharpest window)</h2>
+    <canvas id="out" width="16" height="9"></canvas>
+
+    <h2 style="margin-top:16px">Temporal windows (click to select)</h2>
+    <div class="thumbs" id="thumbs"></div>
+
+    <h2 style="margin-top:16px">Single frame (unreadable by design)</h2>
+    <canvas id="raw" width="16" height="9"></canvas>
+  </div>
+</main>
+
+<video id="vid" muted playsinline></video>
+
+<script>
+const $ = id => document.getElementById(id);
+const vid = $('vid'), out = $('out'), raw = $('raw');
+const octx = out.getContext('2d', { willReadFrequently: true });
+const rctx = raw.getContext('2d');
+let W = 0, H = 0, maps = [], sel = -1;
+
+const bind = (r, v, f = x => x) => { const u = () => $(v).textContent = f($(r).value); $(r).oninput = u; u(); };
+bind('maxw','vw'); bind('len','vlen'); bind('crop','vcrop'); bind('sig','vsig', x => (+x).toFixed(1));
+['sig','crop','pol'].forEach(id => $(id).oninput = () => { if (maps.length) { drawThumbs(); showMap(sel); } });
+
+$('file').onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  vid.src = URL.createObjectURL(f);
+  vid.onloadedmetadata = () => { $('run').disabled = false;
+    log(`Loaded ${vid.videoWidth}x${vid.videoHeight}, ${vid.duration.toFixed(2)} s.`); };
+};
+$('run').onclick = run;
+$('ocr').onclick = readText;
+$('save').onclick = () => {
+  const d = new Date(), p = n => String(n).padStart(2,'0');
+  const a = document.createElement('a');
+  a.download = `decoded_${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}.png`;
+  a.href = out.toDataURL('image/png'); a.click();
+};
+const log = s => $('log').textContent = s;
+const idle = () => new Promise(r => setTimeout(r, 0));
+
+/* ---------------- frame capture ---------------- */
+async function capture(){
+  const sc = Math.min(1, +$('maxw').value / vid.videoWidth);
+  W = Math.round(vid.videoWidth * sc); H = Math.round(vid.videoHeight * sc);
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const cx = c.getContext('2d', { willReadFrequently: true });
+  const frames = [];
+  const grab = () => {
+    cx.drawImage(vid, 0, 0, W, H);
+    const d = cx.getImageData(0, 0, W, H).data, g = new Uint8Array(W * H);
+    for (let i = 0, j = 0; i < g.length; i++, j += 4)
+      g[i] = (d[j] * 77 + d[j+1] * 150 + d[j+2] * 29) >> 8;
+    frames.push(g);
+  };
+  vid.currentTime = 0;
+  if ('requestVideoFrameCallback' in HTMLVideoElement.prototype){
+    await new Promise(res => {
+      const cb = () => { grab(); log(`Capturing frames: ${frames.length}`);
+        if (vid.ended) return res(); vid.requestVideoFrameCallback(cb); };
+      vid.requestVideoFrameCallback(cb); vid.onended = res; vid.play();
+    });
+  } else {
+    for (let t = 0; t < vid.duration - 1e-3; t += 1/30){
+      await new Promise(res => { vid.onseeked = res; vid.currentTime = t; });
+      grab(); if (frames.length % 15 === 0){ log(`Capturing frames: ${frames.length}`); await idle(); }
+    }
+  }
+  vid.pause();
+  return frames;
+}
+
+/* ---------------- global shift: integer SAD + parabolic subpixel ---------------- */
+function sad(A, B, dx, dy, stride){
+  const m = 16; let s = 0, n = 0;
+  for (let y = m; y < H - m; y += stride){
+    const ys = y - dy; if (ys < 0 || ys >= H) return Infinity;
+    for (let x = m; x < W - m; x += stride){
+      const xs = x - dx; if (xs < 0 || xs >= W) continue;
+      s += Math.abs(A[ys * W + xs] - B[y * W + x]); n++;
+    }
+  }
+  return n ? s / n : Infinity;
+}
+const parab = (a, b, c) => { const d = a - 2*b + c; return Math.abs(d) < 1e-6 ? 0 : Math.max(-1, Math.min(1, 0.5*(a - c)/d)); };
+function shiftEst(A, B, pdx, pdy, rad){
+  const stride = rad > 4 ? 6 : 4;
+  let bx = pdx, by = pdy, best = Infinity;
+  for (let dy = pdy - rad; dy <= pdy + rad; dy++)
+    for (let dx = pdx - rad; dx <= pdx + rad; dx++){
+      const s = sad(A, B, dx, dy, stride);
+      if (s < best){ best = s; bx = dx; by = dy; }
+    }
+  const fy = parab(sad(A,B,bx,by-1,stride), best, sad(A,B,bx,by+1,stride));
+  const fx = parab(sad(A,B,bx-1,by,stride), best, sad(A,B,bx+1,by,stride));
+  return [bx + fx, by + fy];
+}
+
+/* ---------------- residual accumulation over temporal windows ---------------- */
+async function run(){
+  ['run','ocr','save'].forEach(i => $(i).disabled = true);
+  $('text').textContent = '\u2014'; $('cands').textContent = ''; maps = []; sel = -1;
+  const frames = await capture();
+  const L = Math.min(+$('len').value, Math.max(10, frames.length - 1));
+  const stride = Math.max(1, Math.floor(L / 2));
+
+  raw.width = W; raw.height = H; out.width = W; out.height = H;
+  const mid = frames[Math.floor(frames.length / 2)];
+  const im = rctx.createImageData(W, H);
+  for (let i = 0, j = 0; i < W*H; i++, j += 4){ im.data[j] = im.data[j+1] = im.data[j+2] = mid[i]; im.data[j+3] = 255; }
+  rctx.putImageData(im, 0, 0);
+
+  const wins = [];
+  for (let s = 0; s + L <= frames.length; s += stride) wins.push({ a: s, b: s + L, acc: new Float32Array(W*H), n: 0 });
+  if (!wins.length) wins.push({ a: 0, b: frames.length, acc: new Float32Array(W*H), n: 0 });
+
+  const R = new Float32Array(W*H);
+  const fast = $('mode').value === 'fd';
+  let dx = 0, dy = 0;
+  for (let k = 1; k < frames.length; k++){
+    const A = frames[k-1], B = frames[k];
+    if (fast){
+      // no motion model: text pixels barely change, background dots vacate every frame.
+      // stored inverted so that "high = text" matches the compensated branch.
+      for (let i = 0; i < R.length; i++) R[i] = 255 - Math.abs(A[i] - B[i]);
+    } else {
+      [dx, dy] = shiftEst(A, B, Math.round(dx), Math.round(dy), k === 1 ? 12 : 2);
+      const x0 = Math.floor(dx), y0 = Math.floor(dy), ax = dx - x0, ay = dy - y0;
+      for (let y = 0; y < H; y++){
+        for (let x = 0; x < W; x++){
+          const sx = x - x0, sy = y - y0;                       // bilinear sample of A
+          const cx0 = Math.min(W-1, Math.max(0, sx)),   cy0 = Math.min(H-1, Math.max(0, sy));
+          const cx1 = Math.min(W-1, Math.max(0, sx-1)), cy1 = Math.min(H-1, Math.max(0, sy-1));
+          const v = A[cy0*W+cx0]*(1-ax)*(1-ay) + A[cy0*W+cx1]*ax*(1-ay)
+                  + A[cy1*W+cx0]*(1-ax)*ay     + A[cy1*W+cx1]*ax*ay;
+          R[y*W+x] = Math.abs(v - B[y*W+x]);
+        }
+      }
+    }
+    for (const w of wins) if (k > w.a && k < w.b){ const a = w.acc; for (let i = 0; i < R.length; i++) a[i] += R[i]; w.n++; }
+    if (k % 5 === 0){
+      $('prog').style.width = (100*k/frames.length) + '%';
+      log(fast ? `Frame difference ${k}/${frames.length}`
+               : `Residual pass ${k}/${frames.length}, background velocity ${dx.toFixed(2)}, ${dy.toFixed(2)} px/frame`);
+      await idle();
+    }
+  }
+  maps = wins.filter(w => w.n > 0).map(w => { for (let i = 0; i < w.acc.length; i++) w.acc[i] /= w.n; return w; });
+  $('prog').style.width = '100%';
+  drawThumbs();
+  const best = maps.map((m, i) => [score(m.acc), i]).sort((p, q) => q[0] - p[0])[0][1];
+  showMap(best);
+  log(`Done. ${frames.length} frames, ${maps.length} windows of ${L}. Sharpest window ${maps[best].a}-${maps[best].b}.`);
+  ['run','ocr','save'].forEach(i => $(i).disabled = false);
+}
+
+/* ---------------- rendering ---------------- */
+function boxBlur(src, rad){
+  if (rad < 1) return src.slice();
+  const t = new Float32Array(W*H), d = new Float32Array(W*H), k = 2*rad+1;
+  for (let y = 0; y < H; y++){
+    let s = 0;
+    for (let x = -rad; x <= rad; x++) s += src[y*W + Math.min(W-1, Math.max(0, x))];
+    for (let x = 0; x < W; x++){ t[y*W+x] = s/k;
+      s += src[y*W + Math.min(W-1, x+rad+1)] - src[y*W + Math.min(W-1, Math.max(0, x-rad))]; }
+  }
+  for (let x = 0; x < W; x++){
+    let s = 0;
+    for (let y = -rad; y <= rad; y++) s += t[Math.min(H-1, Math.max(0, y))*W + x];
+    for (let y = 0; y < H; y++){ d[y*W+x] = s/k;
+      s += t[Math.min(H-1, y+rad+1)*W + x] - t[Math.min(H-1, Math.max(0, y-rad))*W + x]; }
+  }
+  return d;
+}
+function cropRect(){
+  const p = +$('crop').value / 100;
+  const x0 = Math.round(W*p), y0 = Math.round(H*p);
+  return [x0, y0, W - 2*x0, H - 2*y0];
+}
+function score(acc){                                  // contrast inside crop = window sharpness
+  const [x0, y0, cw, ch] = cropRect(); let s = 0, s2 = 0, n = 0;
+  for (let y = y0; y < y0+ch; y++) for (let x = x0; x < x0+cw; x++){ const v = acc[y*W+x]; s += v; s2 += v*v; n++; }
+  return Math.sqrt(s2/n - (s/n)**2);
+}
+function toCanvas(acc, cv){
+  const sig = +$('sig').value, rad = Math.round(sig*1.2);
+  let g = acc; for (let i = 0; i < 3 && rad >= 1; i++) g = boxBlur(g, rad);
+  const [x0, y0, cw, ch] = cropRect();
+  let lo = Infinity, hi = -Infinity;
+  for (let y = y0; y < y0+ch; y++) for (let x = x0; x < x0+cw; x++){ const v = g[y*W+x]; if (v<lo) lo=v; if (v>hi) hi=v; }
+  const dark = $('pol').value === '1';
+  cv.width = cw; cv.height = ch;
+  const cx = cv.getContext('2d', { willReadFrequently: true });
+  const im = cx.createImageData(cw, ch);
+  for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++){
+    let v = (g[(y+y0)*W + x + x0] - lo) / Math.max(hi-lo, 1e-6);   // 1 = incoherent (text)
+    v = Math.min(1, Math.max(0, v));
+    const px = Math.round(255 * (dark ? 1-v : v)), j = 4*(y*cw+x);
+    im.data[j] = im.data[j+1] = im.data[j+2] = px; im.data[j+3] = 255;
+  }
+  cx.putImageData(im, 0, 0);
+}
+function showMap(i){ sel = i; toCanvas(maps[i].acc, out);
+  [...$('thumbs').children].forEach((c, k) => c.classList.toggle('sel', k === i)); }
+function drawThumbs(){
+  const t = $('thumbs'); t.innerHTML = '';
+  maps.forEach((m, i) => { const cv = document.createElement('canvas');
+    toCanvas(m.acc, cv); cv.title = `frames ${m.a}-${m.b}`; cv.onclick = () => showMap(i); t.appendChild(cv); });
+}
+
+/* ---------------- OCR ---------------- */
+function deghost(g, w, h){
+  // The map often contains a vertical echo of the text (the text drifts during the window).
+  // Estimate the echo offset from the autocorrelation of the column-mean profile,
+  // then subtract shifted copies. Works on "text = high" values.
+  const col = new Float32Array(h);
+  for (let y = 0; y < h; y++){ let s = 0; for (let x = 0; x < w; x++) s += g[y*w+x]; col[y] = s / w; }
+  const mu = col.reduce((a,b) => a+b, 0) / h;
+  for (let y = 0; y < h; y++) col[y] -= mu;
+  let e0 = 0; for (let y = 0; y < h; y++) e0 += col[y]*col[y];
+  let d = 0, best = 0;
+  const lo = Math.max(8, Math.round(h*0.03)), hi = Math.round(h*0.25);
+  for (let k = lo; k <= hi; k++){
+    let s = 0; for (let y = 0; y < h - k; y++) s += col[y]*col[y+k];
+    const c = s / e0;
+    if (c > best){ best = c; d = k; }
+  }
+  if (best < 0.35 || d === 0) return g;               // no significant echo, leave untouched
+  const a = Math.min(0.6, best * 0.75);
+  const outv = new Float32Array(w*h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++){
+    let v = g[y*w+x];
+    if (y - d >= 0) v -= a * g[(y-d)*w+x];            // downward echo
+    if (y + d < h)  v -= 0.3 * a * g[(y+d)*w+x];      // weaker upward echo
+    outv[y*w+x] = Math.max(0, v);
+  }
+  return outv;
+}
+function prep(thin){          // de-ghost, Otsu binarize, optional stroke thinning, 2x upscale
+  const src = octx.getImageData(0, 0, out.width, out.height);
+  const w = out.width, h = out.height;
+  let f = new Float32Array(w*h);
+  const darkText = $('pol').value === '1';
+  for (let i = 0, j = 0; i < w*h; i++, j += 4)
+    f[i] = darkText ? 255 - src.data[j] : src.data[j];   // text = high
+  f = deghost(f, w, h);
+  let mx = 0; for (const v of f) if (v > mx) mx = v;
+  const g = new Uint8Array(w*h);
+  for (let i = 0; i < w*h; i++) g[i] = 255 - Math.round(255 * f[i] / Math.max(mx, 1)); // text = dark again
+
+  const hist = new Array(256).fill(0); for (const v of g) hist[v]++;
+  let sum = 0; for (let i = 0; i < 256; i++) sum += i*hist[i];
+  let sB = 0, wB = 0, best = -1, thr = 128;
+  for (let i = 0; i < 256; i++){
+    wB += hist[i]; if (!wB) continue; const wF = g.length - wB; if (!wF) break;
+    sB += i*hist[i];
+    const between = wB*wF * ((sB/wB) - ((sum-sB)/wF))**2;
+    if (between > best){ best = between; thr = i; }
+  }
+  let b = new Uint8Array(w*h);
+  for (let i = 0; i < g.length; i++) b[i] = g[i] > thr ? 255 : 0;   // 255 = background
+
+  if (thin){                  // 3x3 max filter on the background erodes the dark strokes apart,
+    const t = new Uint8Array(w*h);                                  // which is what separates H from N
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++){
+      let m = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++){
+        const yy = Math.min(h-1, Math.max(0, y+dy)), xx = Math.min(w-1, Math.max(0, x+dx));
+        if (b[yy*w+xx] > m) m = b[yy*w+xx];
+      }
+      t[y*w+x] = m;
+    }
+    b = t;
+  }
+  const cv = document.createElement('canvas'); cv.width = 2*w; cv.height = 2*h;
+  const cx = cv.getContext('2d');
+  const im = cx.createImageData(2*w, 2*h);
+  for (let y = 0; y < 2*h; y++) for (let x = 0; x < 2*w; x++){
+    const v = b[(y>>1)*w + (x>>1)], j = 4*(y*2*w + x);
+    im.data[j] = im.data[j+1] = im.data[j+2] = v; im.data[j+3] = 255;
+  }
+  cx.putImageData(im, 0, 0);
+  return cv;
+}
+const loadTess = () => new Promise((res, rej) => {
+  if (window.Tesseract) return res();
+  const s = document.createElement('script');
+  s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+  s.onload = res; s.onerror = () => rej(new Error('CDN unreachable, OCR needs a network connection'));
+  document.head.appendChild(s);
+});
+function pickBest(cands){          // confidence-weighted mode; word-slot fusion as fallback
+  const tally = new Map();
+  for (const c of cands){
+    if (c.text.length < 4) continue;
+    const alpha = (c.text.match(/[A-Z]/g) || []).length;
+    const w = Math.max(1, c.conf) * (1 + alpha / 20);
+    const e = tally.get(c.text) || { n: 0, w: 0 };
+    e.n++; e.w += w; tally.set(c.text, e);
+  }
+  const rank = [...tally.entries()].sort((a, b) => b[1].w - a[1].w || b[1].n - a[1].n);
+  if (rank.length && rank[0][1].n >= 2) return rank;   // a repeated exact string wins outright
+
+  // degraded maps rarely repeat a full string; fuse per word slot instead.
+  const rows = cands.map(c => c.text.split(' ')).filter(r => r.length >= 3);
+  if (rows.length >= 3){
+    const lenTally = new Map();
+    for (const r of rows) lenTally.set(r.length, (lenTally.get(r.length) || 0) + 1);
+    const L = [...lenTally.entries()].sort((a,b) => b[1]-a[1])[0][0];
+    const sameL = rows.filter(r => r.length === L);
+    if (sameL.length >= 2){
+      const fusedWords = [];
+      for (let i = 0; i < L; i++){
+        const t = new Map();
+        for (const r of sameL) t.set(r[i], (t.get(r[i]) || 0) + 1);
+        fusedWords.push([...t.entries()].sort((a,b) => b[1]-a[1])[0][0]);
+      }
+      const fused = fusedWords.join(' ');
+      rank.unshift([fused, { n: sameL.length, w: 1e6, fused: true }]);
+    }
+  }
+  return rank;
+}
+async function readText(){
+  $('ocr').disabled = true;
+  try {
+    await readTess();
+  } catch (e){
+    $('cands').innerHTML = `<span class="note">${e.message}. The coherence map above is still valid.</span>`;
+    log('Reader unavailable.');
+  }
+  $('ocr').disabled = false;
+}
+async function readTess(){
+  {
+    log('Loading OCR engine...'); await loadTess();
+    const worker = await Tesseract.createWorker('eng');
+    const order = maps.map((m, i) => [score(m.acc), i]).sort((a,b) => b[0]-a[0]).slice(0, 3).map(p => p[1]);
+    const cands = [];
+    for (const i of order){
+      showMap(i);
+      for (const thin of [true, false]){
+        const cv = prep(thin);
+        for (const psm of ['6','11']){
+          await worker.setParameters({ tessedit_pageseg_mode: psm,
+            tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ' });
+          const { data } = await worker.recognize(cv);
+          const t = data.text.toUpperCase().replace(/[^A-Z0-9 \n]/g, ' ').split(/\s+/).join(' ').trim();
+          if (t) cands.push({ text: t, conf: data.confidence || 0, win: `${maps[i].a}-${maps[i].b}`, thin, psm });
+          log(`OCR window ${maps[i].a}-${maps[i].b}, psm ${psm}, ${thin ? 'thinned' : 'raw'}`);
+          await idle();
+        }
+      }
+    }
+    await worker.terminate();
+    showMap(order[0]);
+    const rank = pickBest(cands);
+    $('text').textContent = rank.length ? rank[0][0] : 'no text recovered';
+    $('cands').textContent = 'candidates (votes, weight):\n' +
+      rank.slice(0, 6).map(([s, e]) => `  ${e.n}x  w=${e.w.toFixed(0)}  ${s}`).join('\n');
+    log('OCR done. The PNG map is ground truth; the string is a best effort.');
+  }
+}
+</script>
+</body>
+</html>
